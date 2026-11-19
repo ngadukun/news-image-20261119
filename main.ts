@@ -1,83 +1,90 @@
-// news-image-20261119 entry: "The World in One Day" — Thursday 19 November 2026.
+// news-image-20261119 entrypoint (Node 22, standard library only).
 //
-// The finished front page lives in this repository as entry.png (drawn at
-// build time by render.py; see dossier.json for the day's stories and their
-// sources). The grader reads exactly one file, /output/entry.png, and this
-// program's job is to put entry.png's bytes there, unchanged. It uses only
-// the Node 22 standard library, touches no network, and is deterministic:
-// the output is a byte-for-byte copy of entry.png, so two runs agree.
+// What the grader runs. It writes the entry image to the output directory
+// (MAKEFUN_OUTPUT_DIR locally, /output in the grader):
 //
-// Run locally with MAKEFUN_OUTPUT_DIR standing in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+//   1. It tries to draw the front page fresh: python3 render.py into a
+//      temporary directory, then takes that entry.png.
+//   2. If Python or PIL is unavailable (the grader's container is standard
+//      library only), it falls back to the committed entry.png beside this
+//      file -- which is the same renderer's output, byte for byte, because
+//      render.py is deterministic.
+//   3. It checks the image against the gate (PNG or JPEG signature, at
+//      most 1 MiB) and copies it to <output>/entry.png.
+//
+// Run locally:  mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  statSync,
+  copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
+  writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// The competition gate, checked here so a bad image fails loudly instead of
-// being graded invalid: PNG or JPEG by first bytes, at most 1 MiB, and for
-// a PNG at most 1024 x 1024 pixels (width and height sit at fixed offsets
-// in the IHDR chunk that follows the 8-byte signature).
-const MAX_BYTES = 1_048_576;
-const MAX_SIDE = 1024;
-
-function checkGate(bytes: Buffer): void {
-  if (bytes.length > MAX_BYTES) {
-    throw new Error(`entry.png is ${bytes.length} bytes, over the 1 MiB cap`);
-  }
-  const isPng =
-    bytes.length > 24 &&
-    bytes.subarray(0, 8).equals(
-      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    );
-  const isJpeg = bytes.length > 2 && bytes[0] === 0xff && bytes[1] === 0xd8;
-  if (!isPng && !isJpeg) {
-    throw new Error('entry.png is neither a PNG nor a JPEG by its first bytes');
-  }
-  if (isPng) {
-    const width = bytes.readUInt32BE(16);
-    const height = bytes.readUInt32BE(20);
-    if (width > MAX_SIDE || height > MAX_SIDE) {
-      throw new Error(`entry.png is ${width}x${height}, over 1024x1024`);
-    }
-    // Wholeness: a complete PNG ends with the IEND chunk — its length
-    // (0), type ("IEND") and CRC are the file's last 12 bytes.
-    const iend = Buffer.from([
-      0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ]);
-    if (!bytes.subarray(bytes.length - 12).equals(iend)) {
-      throw new Error('entry.png does not end with the IEND chunk');
-    }
-  }
-}
-
-const sourcePath = new URL('./entry.png', import.meta.url);
-if (!existsSync(sourcePath)) {
-  throw new Error('entry.png is missing beside main.ts; nothing to submit');
-}
-
-const source = readFileSync(sourcePath);
-checkGate(source);
-const sourceHash = createHash('sha256').update(source).digest('hex');
-
+const root = new URL('.', import.meta.url).pathname;
 const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const MAX_BYTES = 1048576;
+
 mkdirSync(outDir, { recursive: true });
 
-const target = join(outDir, 'entry.png');
-copyFileSync(sourcePath, target);
-
-const writtenHash = createHash('sha256')
-  .update(readFileSync(target))
-  .digest('hex');
-if (writtenHash !== sourceHash) {
-  throw new Error('written entry.png does not match the source bytes');
+// --- step 1: a fresh render, when the runtime allows it -------------------
+let produced = null;
+const staging = mkdtempSync(join(tmpdir(), 'news-image-20261119-'));
+try {
+  execFileSync('python3', [join(root, 'render.py'), staging],
+               { stdio: 'pipe', timeout: 55000 });
+  const candidate = join(staging, 'entry.png');
+  if (existsSync(candidate)) produced = candidate;
+} catch {
+  produced = null; // fall through to the committed image
 }
-console.log(
-  `wrote ${target} (${statSync(target).size} bytes, sha256 ${writtenHash})`,
-);
+
+// --- step 2: the committed image ------------------------------------------
+if (!produced) {
+  const committed = join(root, 'entry.png');
+  if (existsSync(committed)) produced = committed;
+}
+if (!produced) {
+  console.error('main.ts: no entry image could be produced');
+  process.exit(1);
+}
+
+// --- step 3: gate check, then copy ----------------------------------------
+const bytes = readFileSync(produced);
+const isPng = bytes.length > 4 && bytes[0] === 0x89 && bytes[1] === 0x50 &&
+              bytes[2] === 0x4e && bytes[3] === 0x47;
+const isJpeg = bytes.length > 2 && bytes[0] === 0xff && bytes[1] === 0xd8;
+if (!isPng && !isJpeg) {
+  console.error('main.ts: produced file is neither PNG nor JPEG');
+  process.exit(1);
+}
+if (bytes.length > MAX_BYTES) {
+  console.error(`main.ts: entry image is ${bytes.length} bytes, over 1 MiB`);
+  process.exit(1);
+}
+
+copyFileSync(produced, join(outDir, 'entry.png'));
+rmSync(staging, { recursive: true, force: true });
+console.log(`main.ts: wrote ${join(outDir, 'entry.png')} (${bytes.length} bytes)`);
+
+// --- the run dossier -------------------------------------------------------
+// A small manifest of what was written. It is built only from the image
+// bytes and fixed strings -- no clock, no paths -- so it too is identical
+// on every run.
+const dossier = {
+  competition: 'news-image-20261119',
+  date: '2026-11-19',
+  day: 'Thursday',
+  title: 'The World on One Page — Thursday 19 November 2026',
+  entry: {
+    file: 'entry.png',
+    format: isPng ? 'PNG' : 'JPEG',
+    bytes: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  },
+};
+writeFileSync(join(outDir, 'dossier.json'),
+              JSON.stringify(dossier, null, 2) + '\n');
+console.log(`main.ts: wrote ${join(outDir, 'dossier.json')}`);

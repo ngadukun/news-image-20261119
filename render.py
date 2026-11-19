@@ -1,251 +1,435 @@
 #!/usr/bin/env python3
-"""Build-time renderer for the news-image-20261119 entry.
+"""Render the news-image-20261119 entry: one front page that sums up the
+world news of Thursday 19 November 2026.
 
-Draws the one-page newspaper front page for Thursday 19 November 2026 and
-writes entry.png (1024x1024). This script is a build tool only: it runs on
-the author's machine with Pillow and system serif fonts. The graded program
-is main.ts (Node 22, standard library only), which copies entry.png to
-/output/entry.png in the sandbox, where no fonts or Pillow exist.
+The page is drawn with PIL on a 2048x2048 canvas (twice the final size) and
+downscaled to 1024x1024, which keeps the type crisp. Everything the entry
+ships is produced here:
 
-Every headline and fact below is the news of Thursday 19 November 2026 as
-reported that day; see dossier.json for story-by-story sources.
+    entry.png                        the judged image (1024x1024 PNG)
+    screenshots/front-page-full.jpg  the same page as a JPEG
+    screenshots/lead-shenzhen-summit.png  crop of the lead story
+    screenshots/story-grid.png       crop of the three story bands
+    screenshots/in-brief.png         crop of the In Brief strip
+    dossier.json                     manifest: files, hashes, story list
+
+Usage: python3 render.py [target-dir]   (default: the directory of this file)
+Deterministic: no clocks, no randomness, fixed fonts -- two runs write the
+same bytes.
 """
+
+import hashlib
+import json
+import os
+import sys
 
 from PIL import Image, ImageDraw, ImageFont
 
-W = H = 1024
-MARGIN = 40
-CW = W - 2 * MARGIN  # content width
+# --------------------------------------------------------------------------
+# Page geometry (final-image pixels; the canvas is drawn at SS x this size)
+# --------------------------------------------------------------------------
+SS = 2                      # supersample factor
+PAGE = 1024                 # final width and height
+MARGIN = 44                 # side margin
+CW = PAGE - 2 * MARGIN      # content width
 
-PAPER = (248, 244, 235)
-INK = (20, 19, 16)
-GRAY = (96, 92, 84)
-RED = (142, 31, 31)
-NAVY = (31, 58, 110)
-GREEN = (30, 91, 58)
+PAPER = (247, 243, 234)
+INK = (18, 20, 26)
+SOFT = (84, 88, 98)         # credits, straps
+RULE = (18, 20, 26)
+HAIR = (196, 190, 174)      # light hairlines between columns
+RED = (163, 32, 40)
+BLUE = (30, 58, 122)
+GREEN = (16, 96, 62)
+WHITE = (250, 248, 243)
 
-F = "/usr/share/fonts/truetype"
-SERIF_BLACK = f"{F}/noto/NotoSerifDisplay-Black.ttf"
-SERIF_BOLD = f"{F}/noto/NotoSerif-Bold.ttf"
-SANS = f"{F}/noto/NotoSans-Regular.ttf"
-SANS_BOLD = f"{F}/noto/NotoSans-Bold.ttf"
-SANS_OBL = f"{F}/noto/NotoSans-Italic.ttf"
+SERIF = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
+SERIF_B = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
+SANS = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+SANS_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+BODY = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
+BODY_I = "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf"
 
-
-def font(path, size):
-    return ImageFont.truetype(path, size)
-
-
-img = Image.new("RGB", (W, H), PAPER)
-d = ImageDraw.Draw(img)
-
-
-def text_w(s, fnt):
-    return d.textlength(s, font=fnt)
+_font_cache = {}
 
 
-def wrap(text, fnt, width):
-    words, lines, cur = text.split(), [], ""
-    for w_ in words:
-        trial = f"{cur} {w_}".strip()
-        if text_w(trial, fnt) <= width:
+def F(path, size):
+    """Font at a final-image size (scaled up for the supersampled canvas)."""
+    key = (path, size)
+    if key not in _font_cache:
+        _font_cache[key] = ImageFont.truetype(path, int(size * SS))
+    return _font_cache[key]
+
+
+# --------------------------------------------------------------------------
+# Text helpers
+# --------------------------------------------------------------------------
+def wrap(draw, text, font, width):
+    """Greedy word wrap; width in final-image pixels."""
+    limit = width * SS
+    lines, cur = [], ""
+    for word in text.split():
+        trial = word if not cur else cur + " " + word
+        if draw.textlength(trial, font=font) <= limit or not cur:
             cur = trial
         else:
             lines.append(cur)
-            cur = w_
+            cur = word
     if cur:
         lines.append(cur)
     return lines
 
 
-def centered(text, y, fnt, fill=INK, spacing=0):
-    if spacing:
-        total = sum(text_w(ch, fnt) for ch in text) + spacing * (len(text) - 1)
-        x = (W - total) / 2
+def tracked(draw, xy, text, font, tracking, fill, anchor_left=True):
+    """Draw letter-spaced text (for kickers and straps). Returns its width."""
+    x, y = xy[0] * SS, xy[1] * SS
+    step = tracking * SS
+    total = sum(draw.textlength(ch, font=font) for ch in text) + step * (len(text) - 1)
+    if not anchor_left:
+        x -= total
+    for ch in text:
+        draw.text((x, y), ch, font=font, fill=fill)
+        x += draw.textlength(ch, font=font) + step
+    return total / SS
+
+
+def centered(draw, y, text, font, fill, tracking=0):
+    if tracking:
+        w = sum(draw.textlength(c, font=font) for c in text) + tracking * SS * (len(text) - 1)
+        x = (PAGE * SS - w) / 2
         for ch in text:
-            d.text((x, y), ch, font=fnt, fill=fill)
-            x += text_w(ch, fnt) + spacing
+            draw.text((x, y * SS), ch, font=font, fill=fill)
+            x += draw.textlength(ch, font=font) + tracking * SS
     else:
-        d.text(((W - text_w(text, fnt)) / 2, y), text, font=fnt, fill=fill)
+        w = draw.textlength(text, font=font)
+        draw.text(((PAGE * SS - w) / 2, y * SS), text, font=font, fill=fill)
 
 
-def rule(y, thickness=2, x0=MARGIN, x1=W - MARGIN):
-    d.rectangle([x0, y, x1, y + thickness - 1], fill=INK)
+# --------------------------------------------------------------------------
+# The stories of Thursday 19 November 2026 (kicker, headline, body, credit)
+# --------------------------------------------------------------------------
+LEAD = {
+    "kicker": "SHENZHEN SUMMIT · APEC",
+    "color": RED,
+    "headline": "Trump, Xi and Putin hold first three-way summit in Shenzhen",
+    "body": ("The presidents of the United States, China and Russia sat down "
+             "together for the first time, meeting on the sidelines of the "
+             "APEC summit. Trump also held a one-to-one with Putin lasting "
+             "some 40 minutes and dominated by Ukraine, and saw Xi, who "
+             "called U.S.–China relations stable and improving."),
+    "credit": "CBS News · BBC News · Japan Times",
+}
 
-
-def block(x, y, width, color, kicker, headline, body, credit,
-          head_size, body_size=16, head_lh=1.04, body_lh=1.18):
-    """Draw one story block; return the y just below its credit line."""
-    kf = font(SANS_BOLD, 15)
-    d.rectangle([x, y + 3, x + 26, y + 9], fill=color)
-    d.text((x + 34, y), kicker, font=kf, fill=color)
-    y += 22
-    hf = font(SERIF_BOLD, head_size)
-    for line in wrap(headline, hf, width):
-        d.text((x, y), line, font=hf, fill=INK)
-        y += int(head_size * head_lh)
-    y += 4
-    bf = font(SANS, body_size)
-    for line in wrap(body, bf, width):
-        d.text((x, y), line, font=bf, fill=INK)
-        y += int(body_size * body_lh)
-    y += 3
-    d.text((x, y), credit, font=font(SANS_OBL, 13), fill=GRAY)
-    return y + 12
-
-
-# ---- masthead -------------------------------------------------------------
-centered("ONE DAY · ONE IMAGE · THE WORLD'S NEWS", 28, font(SANS, 15),
-         fill=GRAY, spacing=3)
-rule(60, 3)
-
-mast = "THE WORLD IN ONE DAY"
-size = 66
-while text_w(mast, font(SERIF_BLACK, size)) > CW:
-    size -= 1
-centered(mast, 74, font(SERIF_BLACK, size))
-
-band_y = 150
-d.rectangle([MARGIN, band_y, W - MARGIN, band_y + 50], fill=INK)
-date = "THURSDAY · 19 NOVEMBER 2026"
-df = font(SANS_BOLD, 29)
-d.text(((W - text_w(date, df)) / 2, band_y + 10), date, font=df,
-       fill=(255, 255, 255))
-rule(band_y + 58, 2)
-
-# ---- lead -----------------------------------------------------------------
-y = block(
-    MARGIN, band_y + 62, CW, RED,
-    "SHENZHEN SUMMIT · APEC",
-    "Trump, Xi and Putin hold first three-way summit in Shenzhen",
-    "The presidents of the United States, China and Russia met together "
-    "for the first time, on the sidelines of the APEC summit. Trump also "
-    "met Putin alone — some 40 minutes, dominated by Ukraine — and Xi, "
-    "who called U.S.–China relations stable and improving.",
-    "CBS News · BBC News · Japan Times",
-    head_size=33,
-)
-rule(y + 2, 2)
-y += 6
-
-# ---- grid row A: two columns ----------------------------------------------
-col2 = (CW - 16) // 2
-ya = block(
-    MARGIN, y, col2, NAVY,
-    "THE HAGUE · WORLD COURT",
-    "World Court delivers judgment in Rohingya genocide case",
-    "The International Court of Justice gave its final judgment in The "
-    "Gambia's case over Myanmar's 2017 crackdown, which drove 730,000 "
-    "Rohingya into Bangladesh. No state had ever been found responsible "
-    "for genocide by the court; the ruling cannot be appealed.",
-    "Reuters · UN Web TV",
-    head_size=21,
-)
-yb = block(
-    MARGIN + col2 + 16, y, col2, RED,
-    "BUSINESS · ARTIFICIAL INTELLIGENCE",
-    "Anthropic's $81.3 billion IPO is the largest market debut on record",
-    "The maker of the Claude chatbot priced its shares at $83, above its "
-    "range, raising $81.3 billion and a valuation near $1.5 trillion. "
-    "Trading starts Thursday on the Nasdaq under the ticker ANT.",
-    "CNBC · Reuters",
-    head_size=21,
-)
-y = max(ya, yb)
-rule(y + 2, 1)
-y += 6
-
-# ---- grid rows B and C: three columns --------------------------------------
-col3 = (CW - 32) // 3
-
-
-def row3(y, stories):
-    ends = []
-    for i, s in enumerate(stories):
-        ends.append(block(MARGIN + i * (col3 + 16), y, col3, *s,
-                          head_size=18, body_size=14))
-    return max(ends)
-
-
-y = row3(y, [
-    (RED, "ENERGY · HORMUZ",
-     "IEA: Hormuz crisis is the greatest threat to energy security ever seen",
-     "The agency's annual report said consumers now absorb the shock as "
-     "other buffers run down. An ADNOC tanker crew member is missing and "
-     "11 were hurt after a strike in the strait.",
-     "IEA · Wire reports"),
-    (NAVY, "UKRAINE WAR",
-     "Ukraine strikes the Crimean Bridge again; traffic suspended",
-     "Crimea's authorities halted traffic after the latest attack on the "
-     "bridge linking Russia to the annexed peninsula — Ukraine's third "
-     "strike on it in a week.",
-     "Wire reports"),
-    (GREEN, "BANGLADESH",
-     "Yunus's ancestral home set on fire as violence hits 28 districts",
-     "Protests by supporters of Sheikh Hasina, sentenced to death, "
-     "spread across Bangladesh; police recorded bomb blasts and burned "
-     "vehicles in 28 districts in ten days.",
-     "Wire reports"),
-])
-rule(y + 2, 1)
-y += 6
-
-y = row3(y, [
-    (GREEN, "CLIMATE · COP31",
-     "Ministers try to unblock COP31 talks in Antalya as a deal stays elusive",
-     "Ministers met in informal session to break the deadlock over the "
-     "climate summit's final text, with a new draft under discussion.",
-     "The Guardian · Wire reports"),
-    (RED, "NORTH KOREA",
-     "IAEA says North Korea is expanding its uranium enrichment",
-     "The UN nuclear agency reported further expansion at the North's "
-     "enrichment facilities. In Seoul, President Lee renewed his call "
-     "for dialogue with Pyongyang.",
-     "IAEA · Straits Times"),
-    (NAVY, "MARKETS",
-     "Europe and Hong Kong fall; Brent slips 2.6% to $89.59",
-     "The FTSE 100 lost 1.30% and the Hang Seng 1.90%; the S&P 500 eased "
-     "0.23% while the Nasdaq rose 0.42%; the VIX stood at 24.56.",
-     "Market data"),
-])
-rule(y + 2, 2)
-y += 6
-
-# ---- in brief ---------------------------------------------------------------
-briefs = [
-    ("Sport:", " Tiafoe beat Cobolli 7–6, 6–0 at the ATP Finals in Turin, "
-     "sending Alcaraz into the semi-finals."),
-    ("Culture:", " Van Gogh's “Châtaigniers en fleurs” sold at Sotheby's "
-     "New York for $190.4 million, a record for the artist."),
-    ("India:", " Cyclone Akvan — more than 100,000 people evacuated in "
-     "Odisha as landfall nears Gopalpur."),
-    ("Israel:", " President Herzog asked former army chief Gadi Eisenkot, "
-     "not Netanyahu, to try to form a government."),
+BAND_A = [
+    {
+        "kicker": "THE HAGUE · WORLD COURT",
+        "color": BLUE,
+        "headline": "World Court delivers judgment in Rohingya genocide case",
+        "body": ("The International Court of Justice gave its final judgment "
+                 "in The Gambia’s case over Myanmar’s 2017 crackdown, which "
+                 "drove 730,000 Rohingya into Bangladesh. No state had ever "
+                 "been found responsible for genocide by the court, and the "
+                 "ruling cannot be appealed."),
+        "credit": "Reuters · UN Web TV",
+    },
+    {
+        "kicker": "BUSINESS · ARTIFICIAL INTELLIGENCE",
+        "color": RED,
+        "headline": "Anthropic’s $81.3 billion IPO is the largest market debut on record",
+        "body": ("The maker of the Claude chatbot priced its shares at $83, "
+                 "above its range, raising $81.3 billion for a valuation "
+                 "near $1.5 trillion. Trading starts Thursday on the Nasdaq "
+                 "under the ticker ANT."),
+        "credit": "CNBC · Reuters",
+    },
 ]
-bf, bb = font(SANS, 15), font(SANS_BOLD, 15)
-x = MARGIN
-d.text((x, y), "IN BRIEF", font=bb, fill=INK)
-x += text_w("IN BRIEF ", bb)
-for lead, rest in briefs:
-    for txt, fnt in ((lead, bb), (rest, bf)):
-        for word in txt.split(" "):
-            if not word:
-                continue
-            wpx = text_w(word + " ", fnt)
-            if x + wpx > W - MARGIN:
-                x = MARGIN
-                y += 19
-            d.text((x, y), word, font=fnt, fill=INK)
-            x += wpx
-y += 16
-rule(y, 2)
 
-# ---- footer -------------------------------------------------------------------
-centered(
-    "Reporting: Reuters · AFP · Associated Press · Al Jazeera · CBS News "
-    "· BBC News — the news of Thursday 19 November 2026, as reported "
-    "that day",
-    y + 8, font(SANS_OBL, 13), fill=GRAY)
+BAND_B = [
+    {
+        "kicker": "ENERGY · HORMUZ",
+        "color": RED,
+        "headline": "IEA: Hormuz crisis is the greatest threat to energy security ever seen",
+        "body": ("The agency’s annual report said consumers now absorb the "
+                 "shock as other buffers run down. An ADNOC tanker crew "
+                 "member is missing and 11 were hurt after a strike in the "
+                 "strait."),
+        "credit": "IEA · Wire reports",
+    },
+    {
+        "kicker": "UKRAINE WAR",
+        "color": BLUE,
+        "headline": "Ukraine strikes the Crimean Bridge again; traffic suspended",
+        "body": ("Crimean authorities halted traffic after the latest attack "
+                 "on the bridge linking Russia to the annexed peninsula — "
+                 "Ukraine’s third strike on it in a week."),
+        "credit": "Wire reports",
+    },
+    {
+        "kicker": "BANGLADESH",
+        "color": GREEN,
+        "headline": "Yunus’s ancestral home set on fire as violence hits 28 districts",
+        "body": ("Protests by supporters of Sheikh Hasina, sentenced to "
+                 "death, spread across Bangladesh; police recorded bomb "
+                 "blasts and burned vehicles in 28 districts in ten days."),
+        "credit": "Wire reports",
+    },
+]
 
-img.save("entry.png", optimize=True)
-print("entry.png written; content bottom at y =", y + 40)
+BAND_C = [
+    {
+        "kicker": "CLIMATE · COP31",
+        "color": GREEN,
+        "headline": "Ministers try to unblock COP31 talks in Antalya as a deal stays elusive",
+        "body": ("Ministers met in informal session to break the deadlock "
+                 "over the climate summit’s final text, with a new draft "
+                 "under discussion."),
+        "credit": "The Guardian · Wire reports",
+    },
+    {
+        "kicker": "NORTH KOREA",
+        "color": RED,
+        "headline": "IAEA says North Korea is expanding its uranium enrichment",
+        "body": ("The UN nuclear agency reported further expansion at the "
+                 "North’s enrichment facilities. In Seoul, President Lee "
+                 "renewed his call for dialogue with Pyongyang."),
+        "credit": "IAEA · Straits Times",
+    },
+    {
+        "kicker": "MARKETS",
+        "color": BLUE,
+        "headline": "Europe and Hong Kong fall; Brent slips 2.6% to $89.59",
+        "body": ("The FTSE 100 lost 1.30% and the Hang Seng 1.90%; the "
+                 "S&P 500 eased 0.23% while the Nasdaq rose 0.42%; the VIX "
+                 "stood at 24.56."),
+        "credit": "Market data",
+    },
+]
+
+BRIEFS = [
+    ("Sport", "Tiafoe beat Cobolli 7–6, 6–0 at the ATP Finals in Turin, "
+              "sending Alcaraz into the semi-finals."),
+    ("Culture", "Van Gogh’s “Châtaigniers en fleurs” sold at Sotheby’s New "
+                "York for $190.4 million, a record for the artist."),
+    ("India", "Cyclone Akvan — more than 100,000 people evacuated in Odisha "
+              "as landfall nears Gopalpur."),
+    ("Israel", "President Herzog asked former army chief Gadi Eisenkot, not "
+               "Netanyahu, to try to form a government."),
+]
+
+FOOTER = ("Reporting: Reuters · AFP · Associated Press · Al Jazeera · "
+          "CBS News · BBC News — the news of Thursday 19 November 2026, "
+          "as reported that day")
+
+
+# --------------------------------------------------------------------------
+# Drawing blocks
+# --------------------------------------------------------------------------
+def story(draw, x, y, w, item, headline_size, body_size, headline_font=SERIF_B):
+    """One story: kicker, headline, body, credit. Returns the y below it."""
+    # kicker with a small colour block
+    draw.rectangle([x * SS, (y + 2) * SS, (x + 22) * SS, (y + 9) * SS],
+                   fill=item["color"])
+    tracked(draw, (x + 30, y - 3), item["kicker"], F(SANS_B, 12.5), 0.6,
+            item["color"])
+    y += 17
+    hf = F(headline_font, headline_size)
+    for line in wrap(draw, item["headline"], hf, w):
+        draw.text((x * SS, y * SS), line, font=hf, fill=INK)
+        y += headline_size * 1.14
+    y += 3
+    bf = F(BODY, body_size)
+    for line in wrap(draw, item["body"], bf, w):
+        draw.text((x * SS, y * SS), line, font=bf, fill=INK)
+        y += body_size * 1.32
+    y += 2
+    draw.text((x * SS, y * SS), item["credit"], font=F(BODY_I, 10.5), fill=SOFT)
+    return y + 15
+
+
+def band(draw, y, items, cols, headline_size, body_size):
+    """A row of stories in `cols` columns with hairlines between them."""
+    gutter = 28 if cols == 2 else 24
+    colw = (CW - gutter * (cols - 1)) / cols
+    bottom = y
+    for i, item in enumerate(items):
+        x = MARGIN + i * (colw + gutter)
+        end = story(draw, x, y, colw, item, headline_size, body_size)
+        bottom = max(bottom, end)
+        if i:
+            lx = x - gutter / 2
+            draw.line([lx * SS, y * SS, lx * SS, (bottom - 8) * SS],
+                      fill=HAIR, width=SS)
+    return bottom
+
+
+def header(draw):
+    """Masthead, date band. Returns the y below the date band."""
+    y = 24
+    f = F(SANS_B, 12)
+    tracked(draw, (MARGIN, y), "THE WORLD’S NEWS, ON ONE PAGE", f, 1.6, SOFT)
+    tracked(draw, (PAGE - MARGIN, y), "WORLD EDITION", f, 1.6, SOFT,
+            anchor_left=False)
+    y += 22
+    draw.rectangle([MARGIN * SS, y * SS, (PAGE - MARGIN) * SS, (y + 3) * SS],
+                   fill=RULE)
+    y += 10
+    centered(draw, y, "THE WORLD ON ONE PAGE", F(SERIF_B, 52), INK, tracking=0.4)
+    y += 62
+    draw.rectangle([MARGIN * SS, y * SS, (PAGE - MARGIN) * SS, (y + 3) * SS],
+                   fill=RULE)
+    draw.rectangle([MARGIN * SS, (y + 5) * SS, (PAGE - MARGIN) * SS,
+                    (y + 6) * SS], fill=RULE)
+    y += 14
+    draw.rectangle([MARGIN * SS, y * SS, (PAGE - MARGIN) * SS, (y + 34) * SS],
+                   fill=INK)
+    centered(draw, y + 6, "THURSDAY · 19 NOVEMBER 2026", F(SANS_B, 19),
+             WHITE, tracking=2.2)
+    return y + 34
+
+
+def briefs(draw, y):
+    """The In Brief strip: a dark band, a label row, then the four short
+    items in a 2x2 grid, each led by a gold section name."""
+    height = 106
+    draw.rectangle([MARGIN * SS, y * SS, (PAGE - MARGIN) * SS,
+                    (y + height) * SS], fill=INK)
+    pad = 16
+    tracked(draw, (MARGIN + pad, y + 9), "IN BRIEF", F(SANS_B, 13), 1.8, WHITE)
+    draw.line([(MARGIN + pad) * SS, (y + 32) * SS, (PAGE - MARGIN - pad) * SS,
+               (y + 32) * SS], fill=(90, 94, 104), width=SS)
+    colw = (CW - 2 * pad - 24) / 2
+    positions = [(0, 0), (1, 0), (0, 1), (1, 1)]
+    for (label, text), (cx, cy) in zip(BRIEFS, positions):
+        x = MARGIN + pad + cx * (colw + 24)
+        ty = y + 40 + cy * 33
+        lab = F(SANS_B, 11.5)
+        draw.text((x * SS, ty * SS), label, font=lab, fill=(240, 200, 120))
+        lw = draw.textlength(label, font=lab) / SS + 7
+        bf = F(SANS, 11)
+        lines = wrap(draw, text, bf, colw - lw)
+        for i, line in enumerate(lines[:2]):
+            draw.text(((x + lw) * SS, (ty + i * 15) * SS), line, font=bf,
+                      fill=WHITE)
+    return y + height
+
+
+def build_page():
+    img = Image.new("RGB", (PAGE * SS, PAGE * SS), PAPER)
+    draw = ImageDraw.Draw(img)
+    marks = {}
+
+    y = header(draw)
+
+    # Lead story, full width; the red accent bar is drawn after the text so
+    # it spans the block's true height (the text starts 18px to its right).
+    y += 14
+    marks["lead_top"] = y
+    lead_end = story(draw, MARGIN + 18, y, CW - 18, LEAD, 37, 15)
+    draw.rectangle([MARGIN * SS, y * SS, (MARGIN + 5) * SS,
+                    (lead_end - 12) * SS], fill=RED)
+    y = lead_end + 2
+    marks["lead_bottom"] = y
+    draw.line([MARGIN * SS, y * SS, (PAGE - MARGIN) * SS, y * SS],
+              fill=RULE, width=2 * SS)
+
+    y += 12
+    marks["grid_top"] = y
+    y = band(draw, y, BAND_A, 2, 20, 13)
+    draw.line([MARGIN * SS, y * SS, (PAGE - MARGIN) * SS, y * SS],
+              fill=HAIR, width=SS)
+    y += 10
+    y = band(draw, y, BAND_B, 3, 18.5, 12.5)
+    draw.line([MARGIN * SS, y * SS, (PAGE - MARGIN) * SS, y * SS],
+              fill=HAIR, width=SS)
+    y += 10
+    y = band(draw, y, BAND_C, 3, 18.5, 12.5)
+    marks["grid_bottom"] = y
+
+    y += 4
+    marks["brief_top"] = y
+    y = briefs(draw, y)
+    marks["brief_bottom"] = y
+
+    y += 8
+    centered(draw, y, FOOTER, F(BODY_I, 11), SOFT)
+    marks["end"] = y + 16
+
+    page = img.resize((PAGE, PAGE), Image.LANCZOS)
+    return page, marks
+
+
+# --------------------------------------------------------------------------
+# Outputs
+# --------------------------------------------------------------------------
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def save_all(target):
+    os.makedirs(os.path.join(target, "screenshots"), exist_ok=True)
+    page, marks = build_page()
+
+    files = {}
+
+    def record(relpath, data):
+        path = os.path.join(target, relpath)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        files[relpath] = {"sha256": sha256(data), "bytes": len(data)}
+
+    import io
+    buf = io.BytesIO()
+    page.save(buf, "PNG")
+    record("entry.png", buf.getvalue())
+
+    buf = io.BytesIO()
+    page.save(buf, "JPEG", quality=88)
+    record("screenshots/front-page-full.jpg", buf.getvalue())
+
+    crops = {
+        "screenshots/lead-shenzhen-summit.png":
+            (0, int(marks["lead_top"]) - 8, PAGE, int(marks["lead_bottom"]) + 6),
+        "screenshots/story-grid.png":
+            (0, int(marks["grid_top"]) - 8, PAGE, int(marks["grid_bottom"]) + 4),
+        "screenshots/in-brief.png":
+            (0, int(marks["brief_top"]) - 6, PAGE, int(marks["brief_bottom"]) + 6),
+    }
+    for relpath, box in crops.items():
+        buf = io.BytesIO()
+        page.crop(box).save(buf, "PNG")
+        record(relpath, buf.getvalue())
+
+    stories = ([{"section": "Lead", "headline": LEAD["headline"]}] +
+               [{"section": s["kicker"], "headline": s["headline"]}
+                for s in BAND_A + BAND_B + BAND_C] +
+               [{"section": "In Brief · " + label, "headline": text}
+                for label, text in BRIEFS])
+    dossier = {
+        "competition": "news-image-20261119",
+        "date": "2026-11-19",
+        "day": "Thursday",
+        "title": "The World on One Page — Thursday 19 November 2026",
+        "renderer": "render.py (PIL, supersampled x2)",
+        "image": "entry.png",
+        "limits": {"max_bytes": 1048576, "max_width": 1024, "max_height": 1024},
+        "stories": stories,
+        "files": files,
+    }
+    data = (json.dumps(dossier, indent=2, ensure_ascii=False) + "\n").encode()
+    record("dossier.json", data)
+    return marks, files
+
+
+def main():
+    target = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(
+        os.path.abspath(__file__))
+    marks, files = save_all(target)
+    print("render.py: wrote", ", ".join(sorted(files)))
+    print("render.py: page content ends at y=%d of %d" % (marks["end"], PAGE))
+    entry = files["entry.png"]
+    print("render.py: entry.png %d bytes sha256 %s"
+          % (entry["bytes"], entry["sha256"]))
+
+
+if __name__ == "__main__":
+    main()
